@@ -38,6 +38,9 @@ def _mongo_or_skip():
         probe.close()
         return version
     except PyMongoError as exc:
+        if os.environ.get("REQUIRE_MONGO") == "1":  # CI: a missing database must fail the build, not skip
+            pytest.fail(f"MongoDB required but not reachable at {redact(TEST_MONGO_URI)}: {type(exc).__name__}",
+                        pytrace=False)
         pytest.skip(f"MongoDB not reachable at {redact(TEST_MONGO_URI)} ({type(exc).__name__}); integration tests skipped",
                     allow_module_level=True)
 
@@ -755,6 +758,73 @@ def test_trend_full_quarter_and_errors(api, trend_data):
     assert r.status_code == 422
     single = api.get("/analytics/departments/Ops/trend", params={"from": "2026-07-01", "to": "2026-07-01"}).json()
     assert len(single["items"]) == 1
+
+
+# =========================================================================== extras
+def test_history_endpoint(api):
+    url = _setup_closed_day(api)
+    empty = api.get(url + "/history")
+    assert empty.status_code == 200 and empty.json() == {"emp_code": "EMP0001", "date": "2026-07-07", "history": []}
+    api.patch(url, json={"status": "WFH", "reason": "worked from home", "regularized_by": "a"})
+    api.patch(url, json={"punch_out": ms(2026, 7, 7, 19, 30), "reason": "forgot to punch", "regularized_by": "b"})
+    body = api.get(url + "/history").json()
+    assert [h["by"] for h in body["history"]] == ["a", "b"]
+    assert body["history"][1]["changes"]["punch_out"]["to"] == ms(2026, 7, 7, 19, 30)  # epoch ms, like the record
+    assert api.get("/attendance/EMP9999/2026-07-07/history").status_code == 404
+    assert api.get("/attendance/EMP0001/2026-07-08/history").status_code == 404
+
+
+@pytest.fixture
+def streak_data(mdb):
+    mdb.employees.insert_many([employee("EMP7001"), employee("EMP7002"), employee("EMP7003", joined="2026-07-08")])
+    mdb.attendance_logs.insert_many([
+        # EMP7001: Wed 1, Thu 2, Fri 3, (weekend), Mon 6 on time = 4-day run across the weekend;
+        # Tue 7 late breaks it; Wed 8, Thu 9, Fri 10 on time = 3; Mon 13 missing; Tue 14 LEAVE; Wed 15 on time = 1
+        record("EMP7001", "2026-07-01"), record("EMP7001", "2026-07-02"), record("EMP7001", "2026-07-03"),
+        record("EMP7001", "2026-07-04"),  # Saturday record: ignored, neither extends nor breaks
+        record("EMP7001", "2026-07-06"), record("EMP7001", "2026-07-07", late=15),
+        record("EMP7001", "2026-07-08", status="WFH"), record("EMP7001", "2026-07-09", status="ON_DUTY"),
+        record("EMP7001", "2026-07-10"), record("EMP7001", "2026-07-14", status="LEAVE", punch_in=None),
+        record("EMP7001", "2026-07-15"),
+        # EMP7002: two 2-day runs -> the earlier one wins the tie
+        record("EMP7002", "2026-07-01"), record("EMP7002", "2026-07-02"), record("EMP7002", "2026-07-06"),
+        record("EMP7002", "2026-07-07"),
+        # EMP7003: joined Wed 8; logs before joining are outside its working days
+        record("EMP7003", "2026-07-07"), record("EMP7003", "2026-07-08"), record("EMP7003", "2026-07-09"),
+    ])
+
+
+def _streaks(api, code):
+    r = api.get(f"/analytics/employees/{code}/streaks", params={"month": "2026-07"})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_streaks_across_weekends_and_breaks(api, streak_data):
+    body = _streaks(api, "EMP7001")
+    assert body["longest_on_time_streak"] == {"days": 4, "start": "2026-07-01", "end": "2026-07-06"}
+    assert (body["on_time_days"], body["on_time_runs"]) == (8, 3)
+
+
+def test_streaks_tie_and_joiner(api, streak_data):
+    assert _streaks(api, "EMP7002")["longest_on_time_streak"] == {"days": 2, "start": "2026-07-01", "end": "2026-07-02"}
+    joiner = _streaks(api, "EMP7003")
+    assert joiner["longest_on_time_streak"] == {"days": 2, "start": "2026-07-08", "end": "2026-07-09"}
+    assert joiner["on_time_days"] == 2
+
+
+def test_streaks_no_logs_and_unknown(api, mdb):
+    mdb.employees.insert_one(employee("EMP7009"))
+    body = _streaks(api, "EMP7009")
+    assert body["longest_on_time_streak"] == {"days": 0, "start": None, "end": None} and body["on_time_days"] == 0
+    assert api.get("/analytics/employees/EMP9999/streaks", params={"month": "2026-07"}).status_code == 404
+
+
+def test_dashboard_and_request_id_through_uvicorn(api):
+    r = api.get("/dashboard", headers={"X-Request-ID": "trace-42"})
+    assert r.status_code == 200 and "Attendance dashboard" in r.text
+    assert r.headers["X-Request-ID"] == "trace-42" and float(r.headers["X-Response-Time-ms"]) >= 0
+    assert "X-Request-ID" in api.get("/health").headers
 
 
 # =========================================================================== explain

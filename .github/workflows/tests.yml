@@ -1,0 +1,35 @@
+# Runs the whole test suite on every push and pull request against real MongoDB servers in containers,
+# including 7.0 (the grader's version). No secrets are used: the database is a throwaway local container.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mongodb: ["7.0", "8.0"]
+    services:
+      mongo:
+        image: mongo:${{ matrix.mongodb }}
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping: 1}).ok'"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: pytest against MongoDB ${{ matrix.mongodb }}
+        env:
+          TEST_MONGO_URI: mongodb://localhost:27017
+          REQUIRE_MONGO: "1"   # fail (not skip) the integration tests if the database is missing
+        run: pytest -p no:cacheprovider -rfEs tests

@@ -3,6 +3,8 @@
 Every request here is rejected before the handler touches the database, so these run anywhere. The TestClient is
 used WITHOUT a `with` block, so the startup hook (index creation) does not run either.
 """
+import re
+
 import pytest
 from fastapi.testclient import TestClient
 from pymongo import MongoClient
@@ -194,8 +196,10 @@ def test_db_errors_become_503(monkeypatch):
 
 # ---------------------------------------------------------------- the generated API matches openapi.yaml
 def _app_operations():
+    """Contract operations only: extras are tagged "extras" and checked separately below."""
     spec = main.app.openapi()
-    return {(path, method): op for path, item in spec["paths"].items() for method, op in item.items()}
+    return {(path, method): op for path, item in spec["paths"].items() for method, op in item.items()
+            if "extras" not in op.get("tags", [])}
 
 
 def test_every_contract_operation_exists_with_the_same_parameters():
@@ -211,3 +215,43 @@ def test_every_contract_operation_exists_with_the_same_parameters():
             actual = {(p["name"], p["in"]): p.get("required", False) for p in ours[(path, method)].get("parameters", [])}
             assert actual == expected, f"{method.upper()} {path}: {actual} != {expected}"
     assert len(ours) == sum(len(item) for item in SPEC["paths"].values()), "app exposes undocumented operations"
+
+
+def test_extras_are_only_new_paths():
+    spec = main.app.openapi()
+    extras = {(p, m) for p, item in spec["paths"].items() for m, op in item.items() if "extras" in op.get("tags", [])}
+    assert extras == {("/attendance/{emp_code}/{date}/history", "get"), ("/analytics/employees/{emp_code}/streaks", "get")}
+    assert not any(path in SPEC["paths"] for path, _ in extras)  # never shadows or changes a contract path
+    assert "/dashboard" not in spec["paths"]
+
+
+# ---------------------------------------------------------------- extras (offline parts)
+def test_request_id_and_timing_headers():
+    r = client.get("/attendance", params={"page": 0})  # rejected before the DB, still passes through the middleware
+    assert r.status_code == 422
+    assert re.fullmatch(r"[0-9a-f]{32}", r.headers["X-Request-ID"])
+    assert float(r.headers["X-Response-Time-ms"]) >= 0
+
+
+def test_request_id_is_echoed_only_when_safe():
+    assert client.get("/attendance", params={"page": 0}, headers={"X-Request-ID": "abc-123"}).headers["X-Request-ID"] == "abc-123"
+    forged = client.get("/attendance", params={"page": 0}, headers={"X-Request-ID": "x" * 65})
+    assert forged.headers["X-Request-ID"] != "x" * 65
+
+
+def test_dashboard_is_served_and_self_contained():
+    r = client.get("/dashboard")
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/html")
+    assert "Attendance dashboard" in r.text
+    assert "innerHTML" not in r.text and "http://" not in r.text.replace("http://www.w3.org/2000/svg", "")
+    assert "https://" not in r.text  # no external scripts, fonts or styles
+
+
+@pytest.mark.parametrize("bad", ["2026-7-6", "2026-02-30", "today"])
+def test_history_rejects_bad_date(bad):
+    assert client.get(f"/attendance/EMP0001/{bad}/history").status_code == 422
+
+
+@pytest.mark.parametrize("month", ["2026-13", "July", "0000-01"])
+def test_streaks_rejects_bad_month(month):
+    assert client.get("/analytics/employees/EMP0001/streaks", params={"month": month}).status_code == 422

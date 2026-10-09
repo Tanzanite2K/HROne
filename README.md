@@ -1,7 +1,11 @@
 # Employee Attendance & Analytics API (HROne assignment)
 
 FastAPI + MongoDB. All application code is in `app/main.py`; it implements every operation in `openapi.yaml`
-(rules R1-R10). `REVIEW.md` lists the starter's defects; `DECISIONS.md` answers the five questions.
+(rules R1-R10) exactly, plus a few clearly separated extras (below). `REVIEW.md` lists the starter's defects;
+`DECISIONS.md` answers the five questions.
+
+<!-- After creating the GitHub repo, replace OWNER/REPO to show the CI badge: -->
+<!-- ![tests](https://github.com/OWNER/REPO/actions/workflows/tests.yml/badge.svg) -->
 
 ## Run
 Requires Python 3.11+ and MongoDB **6.0+** (uses `$densify`, `$setWindowFields`, `$dateAdd`, and `$documents`
@@ -63,8 +67,21 @@ free tier) using a throwaway `hrone_test_<random>` database.
 COLLSCAN; median latency: list 6-58 ms, monthly 3 ms, leaderboard 95 ms, 92-day trend 64 ms, department summary
 243 ms.
 
+## Extras beyond the contract
+Additive only: no contract path, field or status code changes, and `tests/test_validation.py` checks that the app's
+contract operations still match `openapi.yaml` one for one.
+
+| Extra | What it does |
+|---|---|
+| CI (`.github/workflows/tests.yml`) | On every push, runs the full suite against MongoDB **7.0** and **8.0** containers; integration tests fail (not skip) if the database is missing |
+| Request id + timing | Every response has `X-Request-ID` (your own id is echoed if it is safe, else a new one) and `X-Response-Time-ms`; one log line per request (`hrone.access` logger) |
+| `GET /attendance/{emp_code}/{date}/history` | Just the audit trail of one record, epoch-ms instants; same 404/422 rules as the PATCH |
+| `GET /analytics/employees/{emp_code}/streaks?month=YYYY-MM` | Longest run of consecutive on-time working days (present, `late_minutes` 0; weekends skipped; a missing, late, ABSENT or LEAVE weekday breaks it), via a gaps-and-islands `$setWindowFields` pipeline |
+| `GET /dashboard` | Read-only HTML page (summary table, leaderboard, trend chart) over the analytics endpoints; no external scripts, hidden from the OpenAPI schema |
+
 ## Known limitations
-- **MongoDB 7.0 compatibility has NOT been tested yet.** The grader uses 7.0; all runs so far used MongoDB 8.0
+- **MongoDB 7.0 compatibility has NOT been tested yet.** The CI workflow runs the suite on 7.0, but only after the
+  first push to GitHub; until that run is green this stays unverified. The grader uses 7.0; all runs so far used MongoDB 8.0
   (local 8.0.6 and Atlas 8.0.34). Every stage the code uses (`$lookup` with `localField` + `pipeline`,
   `$setWindowFields`/`$rank`, `$densify`, `$dateAdd`, `$documents` in `$unionWith`) is documented for 6.0+, so no
   difference is expected, but it is unverified. To check: `docker run -p 27017:27017 mongo:7`, then

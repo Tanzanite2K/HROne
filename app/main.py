@@ -12,6 +12,7 @@ Layout of this file (everything lives here, as the assignment requires):
     5. Endpoints: system, employees, attendance
     6. Aggregation pipeline builders (shared by the analytics endpoints and /admin/explain)
     7. Endpoints: analytics, admin
+    8. Extras beyond the contract (tagged "extras"; nothing in sections 1-7 depends on them)
 """
 from __future__ import annotations
 
@@ -19,16 +20,18 @@ import json
 import logging
 import os
 import re
+import uuid
 from contextlib import asynccontextmanager
 from datetime import date as Date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
+from time import perf_counter
 from typing import Annotated, Any, Literal, Optional
 
 from bson import Decimal128, json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import ConnectionFailure, DuplicateKeyError, PyMongoError
@@ -103,6 +106,27 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", life
 async def _db_unavailable(_: Request, exc: ConnectionFailure) -> JSONResponse:
     # A lost database connection is "service unavailable", never an unexplained 500.
     return JSONResponse(status_code=503, content={"detail": "Database unavailable"})
+
+
+# Extra (not in the contract): every response carries a request id and its server-side duration, and one log line
+# per request ties them together. Bodies and status codes are untouched, so the contract is unaffected.
+access_log = logging.getLogger("hrone.access")
+REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+@app.middleware("http")
+async def request_id_and_timing(request: Request, call_next):
+    incoming = request.headers.get("x-request-id", "")
+    # Reuse the caller's id only if it is short and safe (no newlines etc. that could forge log lines).
+    request_id = incoming if REQUEST_ID_PATTERN.fullmatch(incoming) else uuid.uuid4().hex
+    started = perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (perf_counter() - started) * 1000
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Response-Time-ms"] = f"{elapsed_ms:.1f}"
+    access_log.info("%s %s %s %.1fms id=%s", request.method, request.url.path, response.status_code, elapsed_ms,
+                    request_id)
+    return response
 
 
 # =========================================================================== #
@@ -1093,3 +1117,191 @@ def explain_endpoint(
     raw = db.command({"explain": command, "verbosity": "executionStats"})
     # Relaxed Extended JSON turns BSON-only types (Timestamp, ObjectId, Decimal128...) into plain JSON.
     return {"endpoint": endpoint.value, "collection": collection, "explain": json.loads(json_util.dumps(raw))}
+
+
+# =========================================================================== #
+# 8. Extras beyond the contract
+#    Additive only: new paths tagged "extras" (plus the request-id middleware in section 1). No contract path,
+#    field or status code changes. /dashboard is excluded from the OpenAPI schema.
+# =========================================================================== #
+class RecordHistory(BaseModel):
+    emp_code: str
+    date: str
+    history: list[HistoryEntry]
+
+
+@app.get("/attendance/{emp_code}/{date}/history", response_model=RecordHistory, tags=["extras"])
+def attendance_history(emp_code: str, date: str):
+    """The audit trail of one record (manual corrections only), oldest first. Same 404/422 rules as the PATCH."""
+    if not re.fullmatch(DATE_PATTERN, date):
+        raise unprocessable("date must be YYYY-MM-DD", "path", "date")
+    parse_calendar_date(date, "path", "date")
+    get_employee_or_404(emp_code)
+    record = logs.find_one({"emp_code": emp_code, "date": date}, {"_id": 0, "history": 1})  # unique-index lookup
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"No attendance record for {emp_code} on {date}")
+    return {"emp_code": emp_code, "date": date,
+            "history": [serialize_history(h) for h in (record.get("history") or [])]}
+
+
+def on_time_streak_pipeline(emp_code: str, month: str) -> list[dict]:
+    """Longest run of consecutive WORKING days (Mon-Fri, from joined_on) on which the employee was present and not
+    late. Weekends are skipped, not breaks; a working day with no record, a late punch, ABSENT or LEAVE breaks it.
+
+    Gaps-and-islands: number the month's working days 0, 1, 2, ... (idx); keep only on-time days and number them
+    again 1, 2, 3, ... (pos, via $setWindowFields). Inside one unbroken run idx and pos rise together, so
+    idx - pos is constant per run and works as a group key."""
+    first, next_first = month_bounds(month, "query", "month")
+    month_start = datetime.combine(first, time(0), tzinfo=UTC)
+    on_time = {"$and": [{"$in": ["$$l.status", list(PRESENCE)]}, {"$eq": [{"$ifNull": ["$$l.late_minutes", 0]}, 0]}]}
+    return [
+        {"$match": {"emp_code": emp_code}},
+        _logs_lookup({"$gte": first.isoformat(), "$lt": next_first.isoformat()}, ["date", "status", "late_minutes"]),
+        {"$project": {
+            "_id": 0,
+            "on_time_dates": {"$map": {"input": {"$filter": {"input": "$logs", "as": "l", "cond": on_time}},
+                                       "as": "l", "in": "$$l.date"}},
+            "working_days": {"$filter": {
+                "input": {"$map": {"input": {"$range": [0, (next_first - first).days]}, "as": "i",
+                                   "in": {"$dateAdd": {"startDate": month_start, "unit": "day", "amount": "$$i"}}}},
+                "as": "d",
+                "cond": {"$and": [{"$lte": [{"$isoDayOfWeek": "$$d"}, 5]},
+                                  {"$gte": [{"$dateToString": {"date": "$$d", "format": "%Y-%m-%d"}}, "$joined_on"]}]},
+            }},
+        }},
+        {"$unwind": {"path": "$working_days", "includeArrayIndex": "idx"}},
+        {"$project": {"idx": 1, "on_time_dates": 1,
+                      "date": {"$dateToString": {"date": "$working_days", "format": "%Y-%m-%d"}}}},
+        {"$match": {"$expr": {"$in": ["$date", "$on_time_dates"]}}},
+        {"$setWindowFields": {"sortBy": {"idx": 1}, "output": {"pos": {"$documentNumber": {}}}}},
+        {"$group": {"_id": {"$subtract": ["$idx", "$pos"]}, "days": {"$sum": 1},
+                    "start": {"$min": "$date"}, "end": {"$max": "$date"}}},
+        {"$sort": {"days": -1, "start": 1}},  # longest first; ties -> earliest run
+        {"$group": {"_id": None, "on_time_days": {"$sum": "$days"}, "runs": {"$sum": 1},
+                    "best": {"$first": {"days": "$days", "start": "$start", "end": "$end"}}}},
+    ]
+
+
+class Streak(BaseModel):
+    days: int
+    start: Optional[str]
+    end: Optional[str]
+
+
+class EmployeeStreaks(BaseModel):
+    emp_code: str
+    month: str
+    on_time_days: int
+    on_time_runs: int
+    longest_on_time_streak: Streak
+
+
+@app.get("/analytics/employees/{emp_code}/streaks", response_model=EmployeeStreaks, tags=["extras"])
+def employee_streaks(emp_code: str, month: MonthQ):
+    pipeline = on_time_streak_pipeline(emp_code, month)
+    get_employee_or_404(emp_code)
+    rows = list(employees.aggregate(pipeline))
+    row = rows[0] if rows else {"on_time_days": 0, "runs": 0, "best": {"days": 0, "start": None, "end": None}}
+    return {"emp_code": emp_code, "month": month, "on_time_days": int(row["on_time_days"]),
+            "on_time_runs": int(row["runs"]), "longest_on_time_streak": row["best"]}
+
+
+@app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+def dashboard():
+    """A read-only page over the analytics endpoints. It only calls this API, loads nothing from the internet, and
+    writes every database value with textContent (never innerHTML), so stored names cannot inject markup."""
+    return DASHBOARD_HTML
+
+
+DASHBOARD_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Attendance dashboard</title>
+<style>
+:root{--bg:#f7f7f5;--card:#fff;--ink:#1d1d1b;--muted:#6b6b66;--line:#e3e2dd;--accent:#2f6fde;--accent2:#d9822b}
+@media (prefers-color-scheme:dark){:root{--bg:#161615;--card:#1f1f1d;--ink:#ecebe6;--muted:#9c9b95;--line:#33322f;
+--accent:#6b9bf0;--accent2:#e9a35a}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,sans-serif}
+header{padding:20px 24px 8px}h1{font-size:20px;margin:0 0 4px}header p{margin:0;color:var(--muted)}
+.controls{display:flex;flex-wrap:wrap;gap:12px;padding:12px 24px}
+label{display:flex;flex-direction:column;font-size:12px;color:var(--muted);gap:4px}
+input,select{font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink)}
+main{display:grid;gap:16px;padding:8px 24px 32px;grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;overflow-x:auto}
+section.wide{grid-column:1/-1}h2{font-size:15px;margin:0 0 10px}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+th,td{text-align:right;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+th:first-child,td:first-child,th.l,td.l{text-align:left}th{font-weight:600;color:var(--muted);font-size:12px}
+.empty,.err{color:var(--muted);padding:8px 0}.err{color:#c0392b}
+svg text{fill:var(--muted);font-size:11px}.legend{display:flex;gap:16px;font-size:12px;color:var(--muted);margin-top:6px}
+.sw{display:inline-block;width:12px;height:3px;vertical-align:middle;margin-right:6px}
+</style></head><body>
+<header><h1>Attendance dashboard</h1><p>Read-only view of the analytics endpoints of this API.</p></header>
+<div class="controls">
+<label>Month<input id="month" type="month"></label>
+<label>Department (trend)<select id="dept"></select></label>
+</div>
+<main>
+<section class="wide"><h2>Department summary</h2><div id="summary"></div></section>
+<section><h2>Late-comers leaderboard</h2><div id="board"></div></section>
+<section><h2>Daily attendance rate</h2><div id="trend"></div>
+<div class="legend"><span><i class="sw" style="background:var(--accent)"></i>attendance rate</span>
+<span><i class="sw" style="background:var(--accent2)"></i>7-day moving average</span></div></section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const el = (tag, text, cls) => { const e = document.createElement(tag); if (text !== undefined) e.textContent = text;
+  if (cls) e.className = cls; return e; };
+const fmt = v => v === null || v === undefined ? "-" : String(v);
+async function api(path) { const r = await fetch(path); if (!r.ok) throw new Error(r.status + " " + path); return r.json(); }
+function table(target, cols, rows) {
+  target.replaceChildren();
+  if (!rows.length) { target.append(el("div", "No data for this month.", "empty")); return; }
+  const t = el("table"), head = el("tr");
+  cols.forEach(([label, , left]) => head.append(el("th", label, left ? "l" : "")));
+  t.append(head);
+  rows.forEach(r => { const tr = el("tr"); cols.forEach(([, key, left]) => tr.append(el("td", fmt(r[key]), left ? "l" : "")));
+    t.append(tr); });
+  target.append(t);
+}
+function chart(target, items) {
+  target.replaceChildren();
+  if (!items.length) { target.append(el("div", "No data.", "empty")); return; }
+  const W = 560, H = 200, L = 36, R = 8, T = 8, B = 22, ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg"); svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.style.width = "100%";
+  const x = i => L + (items.length < 2 ? 0 : i * (W - L - R) / (items.length - 1)), y = v => T + (1 - v) * (H - T - B);
+  const add = (tag, attrs, text) => { const n = document.createElementNS(ns, tag);
+    Object.entries(attrs).forEach(([k, v]) => n.setAttribute(k, v)); if (text) n.textContent = text; svg.append(n); };
+  [0, 0.5, 1].forEach(v => { add("line", {x1: L, x2: W - R, y1: y(v), y2: y(v), stroke: "var(--line)"});
+    add("text", {x: 4, y: y(v) + 4}, (v * 100) + "%"); });
+  add("text", {x: L, y: H - 4}, items[0].date); add("text", {x: W - R, y: H - 4, "text-anchor": "end"}, items.at(-1).date);
+  const path = key => { let d = "", pen = false;
+    items.forEach((it, i) => { const v = it[key]; if (v === null) { pen = false; return; }
+      d += (pen ? "L" : "M") + x(i).toFixed(1) + " " + y(v).toFixed(1); pen = true; }); return d; };
+  add("path", {d: path("attendance_rate"), fill: "none", stroke: "var(--accent)", "stroke-width": 2});
+  add("path", {d: path("moving_avg_7d"), fill: "none", stroke: "var(--accent2)", "stroke-width": 2});
+  target.append(svg);
+}
+async function load() {
+  const month = $("month").value; if (!month) return;
+  const [y, m] = month.split("-").map(Number), last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  try {
+    const summary = await api(`/analytics/departments/summary?month=${month}`);
+    table($("summary"), [["Department", "department", true], ["Headcount", "headcount"], ["Present days", "present_days"],
+      ["Avg hours", "avg_work_hours"], ["Late", "late_count"], ["Late min", "total_late_minutes"], ["Leave", "leave_count"],
+      ["On duty", "on_duty_count"]], summary.items);
+    const sel = $("dept"), keep = sel.value; sel.replaceChildren();
+    summary.items.forEach(i => sel.append(el("option", i.department)));
+    if ([...sel.options].some(o => o.value === keep)) sel.value = keep;
+    const board = await api(`/analytics/leaderboard/late?month=${month}&limit=10`);
+    table($("board"), [["Rank", "rank"], ["Employee", "emp_code", true], ["Name", "name", true],
+      ["Late min", "total_late_minutes"], ["Late days", "late_count"]], board.items);
+    if (sel.value) {
+      const t = await api(`/analytics/departments/${encodeURIComponent(sel.value)}/trend?from=${month}-01&to=${month}-${String(last).padStart(2, "0")}`);
+      chart($("trend"), t.items);
+    } else { chart($("trend"), []); }
+  } catch (e) { $("summary").replaceChildren(el("div", "Could not load: " + e.message, "err")); }
+}
+const now = new Date(); $("month").value = now.toISOString().slice(0, 7);
+$("month").addEventListener("change", load); $("dept").addEventListener("change", load); load();
+</script></body></html>
+"""
