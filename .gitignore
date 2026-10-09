@@ -1,0 +1,24 @@
+# --- secrets and local configuration: never commit ---
+.env
+.env.*
+!.env.example
+*.env
+*credentials*
+*.pem
+*.key
+secrets/
+
+# --- original candidate kit material not needed to run or test the app ---
+PROBLEM_STATEMENT.docx
+*.zip
+candidate_kit/
+
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# --- local helper scripts and logs ---
+_local/
